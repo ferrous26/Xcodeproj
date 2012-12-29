@@ -17,6 +17,77 @@
 VALUE Xcodeproj = Qnil;
 
 
+#define CONVERT_CFNUM(type, cookie, macro) do {		        \
+    type value;							\
+    if (CFNumberGetValue(num, cookie, &value))			\
+      return macro(value);					\
+    rb_raise(rb_eRuntimeError, "I goofed wrapping a number");	\
+    return Qnil;						\
+  } while(0);
+
+#define CONVERT_NUM(type, cookie, macro) do {	\
+    type base = macro(num);			\
+    return CFNumberCreate(NULL, cookie, &base); \
+  } while(0);
+
+static VALUE convert_cflong(CFNumberRef num)      { CONVERT_CFNUM(long, kCFNumberLongType, LONG2FIX);          }
+static VALUE convert_cflong_long(CFNumberRef num) { CONVERT_CFNUM(long long, kCFNumberLongLongType, LL2NUM);   }
+static VALUE convert_cffloat(CFNumberRef num)     { CONVERT_CFNUM(double,    kCFNumberDoubleType,   rb_float_new);  }
+
+static CFNumberRef convert_rbfixnum(VALUE num) { CONVERT_NUM(long,      kCFNumberLongType,     NUM2LONG); }
+static CFNumberRef convert_rbbignum(VALUE num) { CONVERT_NUM(long long, kCFNumberLongLongType, NUM2LL);   }
+static CFNumberRef convert_rbfloat(VALUE num)  { CONVERT_NUM(double,    kCFNumberDoubleType,   NUM2DBL);  }
+
+static VALUE
+cfnum_to_num(CFNumberRef number) {
+  switch (CFNumberGetType(number)) {
+  case kCFNumberSInt8Type:
+  case kCFNumberSInt16Type:
+  case kCFNumberSInt32Type:
+  case kCFNumberSInt64Type:
+    return convert_cflong(number);
+  case kCFNumberFloat32Type:
+  case kCFNumberFloat64Type:
+    return convert_cffloat(number);
+  case kCFNumberCharType:
+  case kCFNumberShortType:
+  case kCFNumberIntType:
+  case kCFNumberLongType:
+    return convert_cflong(number);
+  case kCFNumberLongLongType:
+    return convert_cflong_long(number);
+  case kCFNumberFloatType:
+  case kCFNumberDoubleType:
+    return convert_cffloat(number);
+  case kCFNumberCFIndexType:
+  case kCFNumberNSIntegerType:
+    return convert_cflong(number);
+  case kCFNumberCGFloatType: // == kCFNumberMaxType
+    return convert_cffloat(number);
+  default:
+    return INT2NUM(0); // unreachable unless system goofed
+  }
+}
+
+static CFNumberRef
+num_to_cfnum(VALUE number) {
+  switch (TYPE(number)) {
+  case T_FIXNUM:
+    return convert_rbfixnum(number);
+  case T_FLOAT:
+    return convert_rbfloat(number);
+  case T_BIGNUM:
+    return convert_rbbignum(number);
+  default:
+    rb_raise(
+	     rb_eRuntimeError,
+	     "wrapping %s is not supported; log a bug?",
+	     rb_string_value_cstr(&number)
+	     );
+    return kCFNumberNegativeInfinity; // unreachable
+  }
+}
+
 static VALUE
 cfstr_to_str(const void *cfstr) {
   CFDataRef data = CFStringCreateExternalRepresentation(NULL, cfstr, kCFStringEncodingUTF8, 0);
@@ -108,6 +179,12 @@ hash_set(const void *keyRef, const void *valueRef, void *hash) {
       }
     }
 
+  } else if (valueType == CFNumberGetTypeID()) {
+    value = cfnum_to_num(valueRef);
+
+  } else if (valueType == CFBooleanGetTypeID()) {
+    value = CFBooleanGetValue(valueRef) ? Qtrue : Qfalse;
+
   } else {
     rb_raise(rb_eTypeError, "Plist contains a hash value object type unsupported by Xcodeproj.");
   }
@@ -118,17 +195,20 @@ hash_set(const void *keyRef, const void *valueRef, void *hash) {
 static int
 dictionary_set(st_data_t key, st_data_t value, CFMutableDictionaryRef dict) {
   CFStringRef keyRef = str_to_cfstr(key);
+  long i, count;
 
   CFTypeRef valueRef = NULL;
-  if (TYPE(value) == T_HASH) {
+  switch (TYPE(value)) {
+  case T_HASH:
     valueRef = CFDictionaryCreateMutable(NULL,
                                          0,
                                          &kCFTypeDictionaryKeyCallBacks,
                                          &kCFTypeDictionaryValueCallBacks);
     rb_hash_foreach(value, dictionary_set, (st_data_t)valueRef);
+    break;
 
-  } else if (TYPE(value) == T_ARRAY) {
-    long i, count = RARRAY_LEN(value);
+  case T_ARRAY:
+    count = RARRAY_LEN(value);
     valueRef = CFArrayCreateMutable(NULL, count, &kCFTypeArrayCallBacks);
     for (i = 0; i < count; i++) {
       VALUE element = RARRAY_PTR(value)[i];
@@ -146,8 +226,23 @@ dictionary_set(st_data_t key, st_data_t value, CFMutableDictionaryRef dict) {
       CFArrayAppendValue((CFMutableArrayRef)valueRef, elementRef);
       CFRelease(elementRef);
     }
+    break;
 
-  } else {
+  case T_FIXNUM:
+  case T_BIGNUM:
+  case T_FLOAT:
+    valueRef = num_to_cfnum(value);
+    break;
+
+  case T_TRUE:
+    valueRef = kCFBooleanTrue;
+    break;
+
+  case T_FALSE:
+    valueRef = kCFBooleanFalse;
+    break;
+
+  default:
     valueRef = str_to_cfstr(value);
   }
 
